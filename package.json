@@ -1,0 +1,10 @@
+{
+  "name": "worker-api",
+  "private": true,
+  "dependencies": {
+    "@cloudflare/puppeteer": "^0.0.15"
+  },
+  "devDependencies": {
+    "wrangler": "^4.35.0"
+  }
+}
