@@ -1,15 +1,6 @@
-name = "video-resolver"
-main = "worker.js"
-compatibility_date = "2024-12-18"
+name = "worker-api"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
 
-# Variables de entorno (se pueden definir aquí, pero es mejor usar el dashboard)
-# [vars]
-# TMDB_API_KEY = "dbc4911c8f173aa6abf92451a7eb263b"
-# STREAMTAPE_LOGIN = "b7256a108ac8cbd04995"
-# STREAMTAPE_API_PASSWORD = "tu_nueva_contraseña"
-
-# KV Namespace (crea uno primero en el dashboard y pega su ID aquí)
-#[[kv_namespaces]]
-#binding = "VIDEO_CACHE"
-#id = "ID_DEL_NAMESPACE_QUE_CREASTE"
-#preview_id = "ID_DEL_NAMESPACE_PREVIEW"
+[browser]
+binding = "BROWSER"
