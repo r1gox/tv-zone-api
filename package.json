@@ -1,10 +1,12 @@
 {
-  "name": "worker-api",
+  "name": "tv-zone-api",
+  "version": "1.0.0",
   "private": true,
-  "dependencies": {
-    "@cloudflare/puppeteer": "^0.0.15"
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
   },
   "devDependencies": {
-    "wrangler": "^4.35.0"
+    "wrangler": "^3.0.0"
   }
 }
