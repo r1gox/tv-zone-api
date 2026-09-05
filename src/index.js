@@ -459,14 +459,48 @@ async function filterAliveChannels(canales, { force = false } = {}) {
 // ============================================================
 // PROXY HLS (playlist + segmentos)
 // ============================================================
+// ============================================================
+// PROXY HLS (robusto)
+// ============================================================
 async function proxyStream(request, target) {
-  const decoded = decodeSafe(target);
+  // 1) Decodificar bien (evita doble encode)
+  let decoded = target;
+  try {
+    // Si viene muy encoded, decodificar hasta 3 veces
+    for (let i = 0; i < 3; i++) {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    }
+  } catch (e) {}
+
+  // Si alguien pasó una URL que ya es de este proxy, sacar la url real
+  try {
+    const maybe = new URL(decoded);
+    if (maybe.pathname === '/proxy' && maybe.searchParams.get('url')) {
+      decoded = maybe.searchParams.get('url');
+      try {
+        decoded = decodeURIComponent(decoded);
+      } catch (e2) {}
+    }
+  } catch (e) {}
+
   if (!/^https?:\/\//i.test(decoded)) {
-    return json({ success: false, error: 'url inválida' }, 400);
+    return json({ success: false, error: 'url inválida', got: decoded }, 400);
   }
 
-  const origin = new URL(request.url).origin;
+  // Bloquear loops raros
+  if (decoded.includes('/proxy?url=')) {
+    try {
+      const u = new URL(decoded);
+      if (u.searchParams.get('url')) decoded = u.searchParams.get('url');
+    } catch (e) {}
+  }
+
+  const workerOrigin = new URL(request.url).origin;
   const headers = buildUpstreamHeaders(decoded);
+
+  // Range del cliente (segmentos)
   const range = request.headers.get('Range');
   if (range) headers['Range'] = range;
 
@@ -476,42 +510,82 @@ async function proxyStream(request, target) {
       method: 'GET',
       headers,
       redirect: 'follow',
-      cf: { cacheTtl: 0 },
+      cf: { cacheTtl: 0, cacheEverything: false },
     });
   } catch (e) {
     return json(
-      { success: false, error: 'No se pudo conectar: ' + (e.message || e) },
+      {
+        success: false,
+        error: 'No se pudo conectar al origen',
+        detail: String(e && e.message ? e.message : e),
+        target: decoded,
+      },
       502
     );
   }
 
+  // Leer un peek del body para detectar playlist aunque content-type mienta
   const ct = (res.headers.get('Content-Type') || '').toLowerCase();
-  const isPlaylist =
-    ct.includes('mpegurl') ||
-    ct.includes('m3u') ||
-    ct.includes('apple.mpegurl') ||
-    /\.m3u8?(\?|$)/i.test(decoded);
+  const urlLooksPlaylist = /\.m3u8?(?:\?|$)/i.test(decoded);
 
-  const outHeaders = new Headers(corsHeaders());
-  outHeaders.set('Access-Control-Allow-Origin', '*');
-  outHeaders.set('Cache-Control', 'no-store');
+  // Clonar para poder inspeccionar texto si hace falta
+  const contentLength = res.headers.get('Content-Length');
+  const smallEnough =
+    !contentLength || Number(contentLength) < 2_000_000; // 2MB
 
-  copyHeader(res, outHeaders, 'Content-Length');
-  copyHeader(res, outHeaders, 'Content-Range');
-  copyHeader(res, outHeaders, 'Accept-Ranges');
+  let isPlaylist = false;
+  let playlistText = null;
 
-  if (isPlaylist && res.ok) {
-    const body = await res.text();
-    const rewritten = rewritePlaylist(body, decoded, origin);
+  if (res.ok && (urlLooksPlaylist || ct.includes('mpegurl') || ct.includes('m3u') || ct.includes('text/plain') || ct.includes('application/octet-stream') || !ct)) {
+    if (smallEnough) {
+      try {
+        const text = await res.text();
+        const head = (text || '').trim().slice(0, 20);
+        if (head.startsWith('#EXTM3U') || text.includes('#EXTINF') || text.includes('#EXT-X-')) {
+          isPlaylist = true;
+          playlistText = text;
+        } else {
+          // No era playlist: devolver como binario/texto tal cual
+          const outHeaders = baseOutHeaders(res);
+          outHeaders.set('Content-Type', ct || 'application/octet-stream');
+          return new Response(text, { status: res.status, headers: outHeaders });
+        }
+      } catch (e) {
+        // si falla el text(), seguimos como stream binario abajo
+      }
+    }
+  }
+
+  // PLAYLIST → reescribir
+  if (isPlaylist && playlistText != null) {
+    const rewritten = rewritePlaylist(playlistText, decoded, workerOrigin);
+    const outHeaders = baseOutHeaders(res);
     outHeaders.set('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+    outHeaders.delete('Content-Length'); // cambió el tamaño
     return new Response(rewritten, { status: 200, headers: outHeaders });
   }
 
+  // SEGMENTO / OTRO → pasar body tal cual
+  const outHeaders = baseOutHeaders(res);
   outHeaders.set(
     'Content-Type',
     res.headers.get('Content-Type') || 'application/octet-stream'
   );
   return new Response(res.body, { status: res.status, headers: outHeaders });
+}
+
+function baseOutHeaders(res) {
+  const outHeaders = new Headers(corsHeaders());
+  outHeaders.set('Access-Control-Allow-Origin', '*');
+  outHeaders.set('Cache-Control', 'no-store');
+  outHeaders.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
+
+  const pass = ['Content-Length', 'Content-Range', 'Accept-Ranges', 'Content-Type'];
+  for (const h of pass) {
+    const v = res.headers.get(h);
+    if (v) outHeaders.set(h, v);
+  }
+  return outHeaders;
 }
 
 function buildUpstreamHeaders(streamUrl) {
@@ -524,7 +598,9 @@ function buildUpstreamHeaders(streamUrl) {
     'User-Agent': UA,
     Accept: '*/*',
     'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+    'Accept-Encoding': 'identity', // importante: evita gzip raro en ts
   };
+
   if (host) {
     headers['Referer'] = host + '/';
     headers['Origin'] = host;
@@ -545,19 +621,23 @@ function rewritePlaylist(body, playlistUrl, workerOrigin) {
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i];
 
-    if (line.includes('URI="')) {
+    // URI="..." dentro de tags (#EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA, etc.)
+    if (/URI="/i.test(line)) {
       line = line.replace(/URI="([^"]+)"/gi, (_, uri) => {
-        const abs = toAbsolute(uri, base, playlistOrigin);
-        return `URI="${workerOrigin}/proxy?url=${encodeURIComponent(abs)}"`;
+        const abs = toAbsolute(uri.trim(), base, playlistOrigin);
+        const proxied = workerOrigin + '/proxy?url=' + encodeURIComponent(abs);
+        return 'URI="' + proxied + '"';
       });
       out.push(line);
       continue;
     }
 
     const trimmed = line.trim();
+
+    // Línea de URL (segmento o sub-playlist)
     if (trimmed && !trimmed.startsWith('#')) {
       const abs = toAbsolute(trimmed, base, playlistOrigin);
-      out.push(`${workerOrigin}/proxy?url=${encodeURIComponent(abs)}`);
+      out.push(workerOrigin + '/proxy?url=' + encodeURIComponent(abs));
       continue;
     }
 
@@ -569,15 +649,17 @@ function rewritePlaylist(body, playlistUrl, workerOrigin) {
 
 function toAbsolute(uri, base, origin) {
   if (!uri) return uri;
+  uri = uri.trim();
   if (/^https?:\/\//i.test(uri)) return uri;
   if (uri.startsWith('//')) return 'https:' + uri;
   if (uri.startsWith('/')) return (origin || '') + uri;
   try {
-    return new URL(uri, base).href;
+    return new URL(uri, base || origin || undefined).href;
   } catch (e) {
-    return base + uri;
+    return (base || '') + uri;
   }
 }
+
 
 // ============================================================
 // PARSER M3U
