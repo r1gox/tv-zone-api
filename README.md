@@ -1,25 +1,21 @@
-# Video Resolver Worker
+# TV Zone API
 
-Worker de Cloudflare que resuelve enlaces de video desde múltiples servicios (Streamtape, etc.) y actúa como proxy para evitar bloqueos CORS.
+API de canales en vivo (cable + IPTV por países).
 
-## Características
+## Endpoints
 
-- ✅ Extractor para **Streamtape** (usando su API oficial).
-- 🔄 Caché en **Cloudflare KV** para reducir peticiones.
-- 📺 Proxy de video para evitar CORS y referer.
-- 🎬 Catálogo desde **TMDB** (películas y series populares).
-- 🧩 Estructura modular para añadir más extractores (Doodstream, Voe, etc.).
+| Ruta | Descripción |
+|------|-------------|
+| `/` | Info y ejemplos |
+| `/tv/cable` | Tu lista ChannelsTV |
+| `/tv/countries` | Lista de países |
+| `/tv/countries/mx` | Canales de México |
+| `/tv/search?q=espn` | Buscar canales |
+| `/proxy?url=` | Proxy CORS para m3u8 |
 
-## Configuración
+## Deploy
 
-1. Clona el repositorio.
-2. Crea un namespace KV en Cloudflare llamado `VIDEO_CACHE`.
-3. En el panel de Cloudflare Workers, añade las siguientes variables de entorno:
-   - `TMDB_API_KEY`: Tu clave de The Movie Database (v3).
-   - `STREAMTAPE_LOGIN`: Tu login de Streamtape.
-   - `STREAMTAPE_API_KEY`: Tu API Key de Streamtape.
-4. Sube el código `worker.js` a tu Worker.
-
-## Uso
-
-### Obtener un video
+```bash
+npm i
+npx wrangler login
+npx wrangler deploy
