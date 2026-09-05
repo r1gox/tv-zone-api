@@ -1,5 +1,5 @@
 /**
- * TV Zone API — Cloudflare Worker (sin proxy)
+ * TV Zone API — Cloudflare Worker
  *
  * Fuentes:
  *  - Cable:  https://raw.githubusercontent.com/r1gox/ChannelsTV/refs/heads/main/tv.m3u
@@ -7,6 +7,11 @@
  *
  * Por defecto: TODOS los canales
  * Filtro opcional: ?alive=1
+ *
+ * Reproducción:
+ *  - play_url: usar SIEMPRE en el player
+ *  - proxy solo si la URL es https + dominio (no IP). IPs → URL directa.
+ *  - /proxy?url=… reescribe playlists HLS cuando el origen es alcanzable desde CF
  *
  * Endpoints:
  *  GET /
@@ -16,6 +21,7 @@
  *  GET /tv/countries/:code
  *  GET /tv/search?q=
  *  GET /tv/health?url=
+ *  GET /proxy?url=
  */
 
 const CABLE_M3U =
@@ -57,8 +63,19 @@ async function handle(request) {
   // ---------- PROXY HLS ----------
   if (parts[0] === 'proxy') {
     const target = url.searchParams.get('url') || '';
-    if (!target || !/^https?:\/\//i.test(decodeSafe(target))) {
-      return json({ success: false, error: 'Falta url' }, 400);
+    const decodedTarget = decodeSafe(target);
+    if (!target || !/^https?:\/\//i.test(decodedTarget)) {
+      return json({ success: false, error: 'Falta url válida (http/https)' }, 400);
+    }
+    // Cloudflare no sirve para proxy a IPs crudas (error 1003 / 403)
+    if (esUrlIpDirecta(decodedTarget)) {
+      return json({
+        success: false,
+        error: 'Proxy no disponible para URLs por IP. Usa la url directa del canal en el player.',
+        code: 'PROXY_IP_BLOCKED',
+        url: decodedTarget,
+        hint: 'Cloudflare Workers bloquea o falla con http://IP:puerto/… (error 1003).',
+      }, 400);
     }
     return proxyHls(request, target, origin);
   }
@@ -68,8 +85,8 @@ async function handle(request) {
     return json({
       success: true,
       service: 'TV Zone API',
-      version: '1.4.0',
-      nota: 'Sin proxy. Usa la url directa del canal en el player. ?alive=1 filtra (permisivo).',
+      version: '1.5.0',
+      nota: 'Usa play_url en el player. Proxy solo para https+dominio; IPs van directas (CF no proxya IP:puerto).',
       endpoints: {
         tv: origin + '/tv',
         cable: origin + '/tv/cable',
@@ -77,6 +94,7 @@ async function handle(request) {
         country: origin + '/tv/countries/{code}',
         search: origin + '/tv/search?q={texto}',
         health: origin + '/tv/health?url={m3u8}',
+        proxy: origin + '/proxy?url={m3u8}',
       },
       ejemplos: {
         cable: origin + '/tv/cable',
@@ -126,6 +144,7 @@ async function handle(request) {
       canales = await filterAliveChannels(canales, { force });
     }
 
+    canales = enriquecerCanales(canales, origin);
     return json({
       success: true,
       fuente: 'cable',
@@ -134,6 +153,7 @@ async function handle(request) {
       total_original: totalOriginal,
       grupos: uniqueGroups(canales),
       canales,
+      nota_play: 'Usa play_url en el player (proxy solo si proxy_ok=true).',
     });
   }
 
@@ -166,6 +186,7 @@ async function handle(request) {
       canales = await filterAliveChannels(canales, { force });
     }
 
+    canales = enriquecerCanales(canales, origin);
     return json({
       success: true,
       fuente: 'iptv-org',
@@ -175,6 +196,7 @@ async function handle(request) {
       total_original: totalOriginal,
       grupos: uniqueGroups(canales),
       canales,
+      nota_play: 'Usa play_url en el player (proxy solo si proxy_ok=true).',
     });
   }
 
@@ -197,6 +219,7 @@ async function handle(request) {
       results = await filterAliveChannels(results, { force });
     }
 
+    results = enriquecerCanales(results, origin);
     return json({
       success: true,
       query: q,
@@ -204,6 +227,7 @@ async function handle(request) {
       filtered: wantAlive,
       total: results.length,
       canales: results,
+      nota_play: 'Usa play_url en el player (proxy solo si proxy_ok=true).',
     });
   }
 
@@ -431,6 +455,56 @@ async function filterAliveChannels(canales, { force = false } = {}) {
   return results;
 }
 
+
+// ============================================================
+// PROXY / PLAY URL
+// ============================================================
+/** true si hostname es IPv4 o IPv6 literal */
+function esUrlIpDirecta(u) {
+  try {
+    const h = new URL(String(u || '')).hostname.replace(/^\[|\]$/g, '');
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return true;
+    if (h.includes(':')) return true; // IPv6
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** Cloudflare Workers solo proxy fiable con https + dominio */
+function puedeProxyCf(u) {
+  try {
+    const x = new URL(String(u || ''));
+    if (x.protocol !== 'https:') return false;
+    if (esUrlIpDirecta(u)) return false;
+    if (!x.hostname || x.hostname === 'localhost') return false;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** Añade proxy_ok + play_url a cada canal */
+function enriquecerCanal(ch, workerOrigin) {
+  if (!ch || typeof ch !== 'object') return ch;
+  const stream = ch.url || null;
+  const ok = !!(stream && puedeProxyCf(stream));
+  const out = Object.assign({}, ch, {
+    proxy_ok: ok,
+    play_url: stream
+      ? (ok
+          ? (workerOrigin + '/proxy?url=' + encodeURIComponent(stream))
+          : stream)
+      : null,
+  });
+  return out;
+}
+
+function enriquecerCanales(canales, workerOrigin) {
+  if (!Array.isArray(canales)) return [];
+  return canales.map((c) => enriquecerCanal(c, workerOrigin));
+}
+
 // ============================================================
 // PARSER M3U
 // ============================================================
@@ -558,7 +632,25 @@ async function proxyHls(request, target, workerOrigin) {
   try {
     res = await fetch(decoded, { method: 'GET', headers, redirect: 'follow' });
   } catch (e) {
-    return json({ success: false, error: String(e.message || e) }, 502);
+    return json({
+      success: false,
+      error: String(e.message || e),
+      code: 'PROXY_FETCH_FAILED',
+      url: decoded,
+      hint: 'El origen no es alcanzable desde Cloudflare Workers.',
+    }, 502);
+  }
+
+  if (!res.ok) {
+    return json({
+      success: false,
+      error: 'Origen respondió HTTP ' + res.status,
+      code: 'PROXY_UPSTREAM_' + res.status,
+      url: decoded,
+      hint: res.status === 403
+        ? 'El servidor del stream bloquea IPs de Cloudflare. Usa play_url directa (sin proxy).'
+        : 'Prueba la url directa del canal en el player.',
+    }, res.status === 403 ? 403 : 502);
   }
 
   const ct = (res.headers.get('Content-Type') || '').toLowerCase();
@@ -587,12 +679,15 @@ async function proxyHls(request, target, workerOrigin) {
           if (/URI="/i.test(line)) {
             return line.replace(/URI="([^"]+)"/gi, (_, uri) => {
               const abs = absUrl(uri, base, originHost);
+              if (esUrlIpDirecta(abs)) return `URI="${abs}"`;
               return `URI="${workerOrigin}/proxy?url=${encodeURIComponent(abs)}"`;
             });
           }
           return line;
         }
         const abs = absUrl(t, base, originHost);
+        // No reescribir a proxy si el segmento es IP (CF lo bloquea)
+        if (esUrlIpDirecta(abs)) return abs;
         return `${workerOrigin}/proxy?url=${encodeURIComponent(abs)}`;
       });
       out.set('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
