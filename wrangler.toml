@@ -1,6 +1,6 @@
-name = "worker-api"
+name = "tv-zone-api"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
 
-[browser]
-binding = "BROWSER"
+[vars]
+# Puedes añadir variables después si quieres
