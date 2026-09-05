@@ -53,6 +53,16 @@ async function handle(request) {
     return new Response(null, { status: 204, headers: corsHeaders() });
   }
 
+
+  // ---------- PROXY HLS ----------
+  if (parts[0] === 'proxy') {
+    const target = url.searchParams.get('url') || '';
+    if (!target || !/^https?:\/\//i.test(decodeSafe(target))) {
+      return json({ success: false, error: 'Falta url' }, 400);
+    }
+    return proxyHls(request, target, origin);
+  }
+  
   // ---------- HOME ----------
   if (path === '/') {
     return json({
@@ -494,8 +504,9 @@ function setCache(key, data, ttl = CACHE_TTL_MS) {
 function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS, HEAD',
+    'Access-Control-Allow-Headers': 'Content-Type, Range',
+    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
   };
 }
 
@@ -507,4 +518,99 @@ function json(data, status = 200) {
       ...corsHeaders(),
     },
   });
+}
+
+
+function decodeSafe(s) {
+  try { return decodeURIComponent(s); } catch (e) { return s; }
+}
+
+async function proxyHls(request, target, workerOrigin) {
+  let decoded = target;
+  try {
+    for (let i = 0; i < 3; i++) {
+      const n = decodeURIComponent(decoded);
+      if (n === decoded) break;
+      decoded = n;
+    }
+  } catch (e) {}
+
+  if (!/^https?:\/\//i.test(decoded)) {
+    return json({ success: false, error: 'url inválida' }, 400);
+  }
+
+  let host = '';
+  try { host = new URL(decoded).origin; } catch (e) {}
+
+  const headers = {
+    'User-Agent': UA,
+    Accept: '*/*',
+    'Accept-Encoding': 'identity',
+  };
+  if (host) {
+    headers['Referer'] = host + '/';
+    headers['Origin'] = host;
+  }
+  const range = request.headers.get('Range');
+  if (range) headers['Range'] = range;
+
+  let res;
+  try {
+    res = await fetch(decoded, { method: 'GET', headers, redirect: 'follow' });
+  } catch (e) {
+    return json({ success: false, error: String(e.message || e) }, 502);
+  }
+
+  const ct = (res.headers.get('Content-Type') || '').toLowerCase();
+  const looksPlaylist =
+    ct.includes('mpegurl') ||
+    ct.includes('m3u') ||
+    /\.m3u8?(?:\?|$)/i.test(decoded);
+
+  const out = new Headers({
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS, HEAD',
+    'Access-Control-Allow-Headers': 'Content-Type, Range',
+    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
+    'Cache-Control': 'no-store',
+  });
+
+  if (looksPlaylist && res.ok) {
+    const text = await res.text();
+    if (text.includes('#EXT')) {
+      const base = decoded.replace(/[^\/?#]+(\?.*)?$/, '');
+      const originHost = host;
+      const lines = text.split(/\r?\n/).map((line) => {
+        const t = line.trim();
+        if (!t) return line;
+        if (t.startsWith('#')) {
+          if (/URI="/i.test(line)) {
+            return line.replace(/URI="([^"]+)"/gi, (_, uri) => {
+              const abs = absUrl(uri, base, originHost);
+              return `URI="${workerOrigin}/proxy?url=${encodeURIComponent(abs)}"`;
+            });
+          }
+          return line;
+        }
+        const abs = absUrl(t, base, originHost);
+        return `${workerOrigin}/proxy?url=${encodeURIComponent(abs)}`;
+      });
+      out.set('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+      return new Response(lines.join('\n'), { status: 200, headers: out });
+    }
+  }
+
+  out.set('Content-Type', res.headers.get('Content-Type') || 'application/octet-stream');
+  if (res.headers.get('Content-Length')) out.set('Content-Length', res.headers.get('Content-Length'));
+  if (res.headers.get('Content-Range')) out.set('Content-Range', res.headers.get('Content-Range'));
+  if (res.headers.get('Accept-Ranges')) out.set('Accept-Ranges', res.headers.get('Accept-Ranges'));
+  return new Response(res.body, { status: res.status, headers: out });
+}
+
+function absUrl(uri, base, originHost) {
+  uri = (uri || '').trim();
+  if (/^https?:\/\//i.test(uri)) return uri;
+  if (uri.startsWith('//')) return 'https:' + uri;
+  if (uri.startsWith('/')) return (originHost || '') + uri;
+  try { return new URL(uri, base).href; } catch (e) { return base + uri; }
 }
