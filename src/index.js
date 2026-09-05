@@ -4,26 +4,35 @@
  *  - Cable:  https://raw.githubusercontent.com/r1gox/ChannelsTV/refs/heads/main/tv.m3u
  *  - Países: iptv-org (https://iptv-org.github.io/iptv/)
  *
+ * Solo devuelve canales que responden (filtro de vivos).
+ * Usa ?all=1 para ver todos sin filtrar.
+ * Usa ?force=1 para re-chequear ignorando cache de salud.
+ *
  * Endpoints:
- *  GET /                 → info + endpoints
- *  GET /tv               → resumen de fuentes
- *  GET /tv/cable         → canales de tu lista ChannelsTV
- *  GET /tv/countries     → lista de países disponibles
- *  GET /tv/countries/:code → canales de un país (ej: mx, es, ar, us)
- *  GET /tv/search?q=espn → búsqueda en cable + país (opcional ?country=mx)
- *  GET /proxy?url=...    → proxy CORS para m3u8 / segmentos
+ *  GET /
+ *  GET /tv
+ *  GET /tv/cable
+ *  GET /tv/countries
+ *  GET /tv/countries/:code
+ *  GET /tv/search?q=...
+ *  GET /tv/health?url=...
+ *  GET /proxy?url=...
  */
 
-const CABLE_M3U = 'https://raw.githubusercontent.com/r1gox/ChannelsTV/refs/heads/main/tv.m3u';
+const CABLE_M3U =
+  'https://raw.githubusercontent.com/r1gox/ChannelsTV/refs/heads/main/tv.m3u';
 const IPTV_ORG_BASE = 'https://iptv-org.github.io/iptv';
 const IPTV_COUNTRIES_INDEX = `${IPTV_ORG_BASE}/index.country.m3u`;
 
-// Cache en memoria del isolate (se resetea al reiniciar el Worker)
-const cache = new Map();
-const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutos
+const CACHE_TTL_MS = 30 * 60 * 1000; // listas M3U: 30 min
+const HEALTH_TTL_MS = 6 * 60 * 60 * 1000; // vivo/muerto: 6 h
+const CHECK_TIMEOUT_MS = 4500;
+const CHECK_CONCURRENCY = 12;
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+
+const cache = new Map();
 
 export default {
   async fetch(request, env, ctx) {
@@ -45,11 +54,14 @@ async function handle(request, env, ctx) {
     return new Response(null, { status: 204, headers: corsHeaders() });
   }
 
-  // ---------- PROXY (CORS para m3u8 / segmentos) ----------
+  // ---------- PROXY ----------
   if (parts[0] === 'proxy') {
     const target = url.searchParams.get('url') || '';
     if (!target || !/^https?:\/\//i.test(target)) {
-      return json({ success: false, error: 'Falta url válida. Uso: /proxy?url={m3u8}' }, 400);
+      return json(
+        { success: false, error: 'Falta url válida. Uso: /proxy?url={m3u8}' },
+        400
+      );
     }
     return proxyStream(request, target);
   }
@@ -59,17 +71,20 @@ async function handle(request, env, ctx) {
     return json({
       success: true,
       service: 'TV Zone API',
-      version: '1.0.0',
+      version: '1.1.0',
+      nota: 'Por defecto solo se devuelven canales vivos. Usa ?all=1 para ver todos.',
       endpoints: {
         tv: origin + '/tv',
         cable: origin + '/tv/cable',
         countries: origin + '/tv/countries',
-        country: origin + '/tv/countries/{code}', // ej: /tv/countries/mx
+        country: origin + '/tv/countries/{code}',
         search: origin + '/tv/search?q={texto}&country={opcional}',
+        health: origin + '/tv/health?url={m3u8}',
         proxy: origin + '/proxy?url={m3u8}',
       },
       ejemplos: {
         cable: origin + '/tv/cable',
+        cable_all: origin + '/tv/cable?all=1',
         mexico: origin + '/tv/countries/mx',
         spain: origin + '/tv/countries/es',
         search: origin + '/tv/search?q=espn',
@@ -82,26 +97,61 @@ async function handle(request, env, ctx) {
     return json({
       success: true,
       fuentes: [
-        { id: 'cable', nombre: 'ChannelsTV (cable)', endpoint: origin + '/tv/cable' },
-        { id: 'countries', nombre: 'IPTV-org por países', endpoint: origin + '/tv/countries' },
+        {
+          id: 'cable',
+          nombre: 'ChannelsTV (cable)',
+          endpoint: origin + '/tv/cable',
+        },
+        {
+          id: 'countries',
+          nombre: 'IPTV-org por países',
+          endpoint: origin + '/tv/countries',
+        },
       ],
     });
+  }
+
+  // ---------- /tv/health ----------
+  if (parts[0] === 'tv' && parts[1] === 'health') {
+    const u = url.searchParams.get('url') || '';
+    if (!u || !/^https?:\/\//i.test(u)) {
+      return json({ success: false, error: 'Falta url válida' }, 400);
+    }
+    const alive = await isStreamAlive(u);
+    return json({ success: true, url: u, alive });
   }
 
   // ---------- /tv/cable ----------
   if (parts[0] === 'tv' && parts[1] === 'cable') {
     const group = url.searchParams.get('group') || null;
+    const showAll = url.searchParams.get('all') === '1';
+    const force = url.searchParams.get('force') === '1';
+
     const data = await getCableChannels();
     let canales = data.canales;
+
     if (group) {
       const g = group.toLowerCase();
       canales = canales.filter((c) => (c.grupo || '').toLowerCase() === g);
     }
+
+    const totalOriginal = canales.length;
+
+    if (!showAll) {
+      canales = await filterAliveChannels(canales, { force });
+    }
+
+    const grupos = [
+      ...new Set(canales.map((c) => c.grupo).filter(Boolean)),
+    ].sort();
+
     return json({
       success: true,
       fuente: 'cable',
+      filtered: !showAll,
       total: canales.length,
-      grupos: data.grupos,
+      total_original: totalOriginal,
+      grupos,
       canales,
     });
   }
@@ -120,32 +170,67 @@ async function handle(request, env, ctx) {
   // ---------- /tv/countries/:code ----------
   if (parts[0] === 'tv' && parts[1] === 'countries' && parts[2]) {
     const code = parts[2].toLowerCase();
+    const showAll = url.searchParams.get('all') === '1';
+    const force = url.searchParams.get('force') === '1';
+
     const data = await getCountryChannels(code);
     if (!data) {
-      return json({ success: false, error: `País no encontrado: ${code}` }, 404);
+      return json(
+        { success: false, error: `País no encontrado: ${code}` },
+        404
+      );
     }
+
+    let canales = data.canales;
+    const totalOriginal = canales.length;
+
+    if (!showAll) {
+      canales = await filterAliveChannels(canales, { force });
+    }
+
+    const grupos = [
+      ...new Set(canales.map((c) => c.grupo).filter(Boolean)),
+    ].sort();
+
     return json({
       success: true,
       fuente: 'iptv-org',
       country: code,
-      total: data.canales.length,
-      grupos: data.grupos,
-      canales: data.canales,
+      filtered: !showAll,
+      total: canales.length,
+      total_original: totalOriginal,
+      grupos,
+      canales,
     });
   }
 
-  // ---------- /tv/search?q= ----------
+  // ---------- /tv/search ----------
   if (parts[0] === 'tv' && parts[1] === 'search') {
     const q = (url.searchParams.get('q') || '').trim().toLowerCase();
     if (!q || q.length < 2) {
-      return json({ success: false, error: 'Usa /tv/search?q=texto (mínimo 2 caracteres)' }, 400);
+      return json(
+        {
+          success: false,
+          error: 'Usa /tv/search?q=texto (mínimo 2 caracteres)',
+        },
+        400
+      );
     }
     const country = (url.searchParams.get('country') || '').toLowerCase() || null;
-    const results = await searchChannels(q, country);
+    const showAll = url.searchParams.get('all') === '1';
+    const force = url.searchParams.get('force') === '1';
+
+    let results = await searchChannels(q, country);
+
+    if (!showAll) {
+      results = await filterAliveChannels(results, { force });
+    }
+
     return json({
       success: true,
       query: q,
       country: country || 'all',
+      filtered: !showAll,
       total: results.length,
       canales: results,
     });
@@ -155,7 +240,7 @@ async function handle(request, env, ctx) {
 }
 
 // ============================================================
-// CABLE (ChannelsTV)
+// CABLE (ChannelsTV - GitHub)
 // ============================================================
 async function getCableChannels() {
   const key = 'cable';
@@ -164,9 +249,11 @@ async function getCableChannels() {
 
   const text = await fetchText(CABLE_M3U);
   const canales = parseM3U(text, 'cable');
-  const grupos = [...new Set(canales.map((c) => c.grupo).filter(Boolean))].sort();
+  const grupos = [
+    ...new Set(canales.map((c) => c.grupo).filter(Boolean)),
+  ].sort();
   const data = { canales, grupos };
-  setCache(key, data);
+  setCache(key, data, CACHE_TTL_MS);
   return data;
 }
 
@@ -178,13 +265,11 @@ async function getCountriesList() {
   const cached = getCache(key);
   if (cached) return cached;
 
-  // Intentamos el índice oficial; si falla, devolvemos lista fija útil
   let countries = [];
   try {
     const text = await fetchText(IPTV_COUNTRIES_INDEX);
-    // El index.country.m3u tiene líneas con group-title = nombre del país
-    // y la URL termina en /countries/xx.m3u
-    const re = /#EXTINF:[^\n]*group-title="([^"]+)"[^\n]*\n(https?:\/\/[^\s]+countries\/([a-z]{2})\.m3u)/gi;
+    const re =
+      /#EXTINF:[^\n]*group-title="([^"]+)"[^\n]*\n(https?:\/\/[^\s]+countries\/([a-z]{2})\.m3u)/gi;
     let m;
     const seen = new Set();
     while ((m = re.exec(text)) !== null) {
@@ -197,9 +282,7 @@ async function getCountriesList() {
         url: `${IPTV_ORG_BASE}/countries/${code}.m3u`,
       });
     }
-  } catch (e) {
-    // fallback de países más usados
-  }
+  } catch (e) {}
 
   if (!countries.length) {
     countries = [
@@ -232,7 +315,7 @@ async function getCountriesList() {
   }
 
   countries.sort((a, b) => a.name.localeCompare(b.name));
-  setCache(key, countries);
+  setCache(key, countries, CACHE_TTL_MS);
   return countries;
 }
 
@@ -246,9 +329,11 @@ async function getCountryChannels(code) {
     const text = await fetchText(m3uUrl);
     if (!text || !text.includes('#EXTINF')) return null;
     const canales = parseM3U(text, 'iptv-org', code);
-    const grupos = [...new Set(canales.map((c) => c.grupo).filter(Boolean))].sort();
+    const grupos = [
+      ...new Set(canales.map((c) => c.grupo).filter(Boolean)),
+    ].sort();
     const data = { canales, grupos };
-    setCache(key, data);
+    setCache(key, data, CACHE_TTL_MS);
     return data;
   } catch (e) {
     return null;
@@ -261,17 +346,18 @@ async function getCountryChannels(code) {
 async function searchChannels(q, countryCode) {
   const results = [];
 
-  // Cable
   try {
     const cable = await getCableChannels();
     for (const c of cable.canales) {
-      if ((c.nombre || '').toLowerCase().includes(q) || (c.grupo || '').toLowerCase().includes(q)) {
+      if (
+        (c.nombre || '').toLowerCase().includes(q) ||
+        (c.grupo || '').toLowerCase().includes(q)
+      ) {
         results.push(c);
       }
     }
   } catch (e) {}
 
-  // País específico o varios comunes
   const codes = countryCode
     ? [countryCode]
     : ['mx', 'es', 'ar', 'co', 'us', 'cl', 'pe'];
@@ -281,20 +367,134 @@ async function searchChannels(q, countryCode) {
       const data = await getCountryChannels(code);
       if (!data) continue;
       for (const c of data.canales) {
-        if ((c.nombre || '').toLowerCase().includes(q) || (c.grupo || '').toLowerCase().includes(q)) {
+        if (
+          (c.nombre || '').toLowerCase().includes(q) ||
+          (c.grupo || '').toLowerCase().includes(q)
+        ) {
           results.push(c);
         }
       }
     } catch (e) {}
   }
 
-  // Deduplicar por URL
   const seen = new Set();
   return results.filter((c) => {
     if (!c.url || seen.has(c.url)) return false;
     seen.add(c.url);
     return true;
   });
+}
+
+// ============================================================
+// HEALTH CHECK (vivo / muerto)
+// ============================================================
+async function isStreamAlive(streamUrl) {
+  if (!streamUrl || !/^https?:\/\//i.test(streamUrl)) return false;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS);
+
+  try {
+    let res = await fetch(streamUrl, {
+      method: 'HEAD',
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: { 'User-Agent': UA, Accept: '*/*' },
+      cf: { cacheTtl: 0 },
+    });
+
+    if (res.status === 405 || res.status === 501 || res.status === 400) {
+      res = await fetch(streamUrl, {
+        method: 'GET',
+        redirect: 'follow',
+        signal: controller.signal,
+        headers: {
+          'User-Agent': UA,
+          Accept: '*/*',
+          Range: 'bytes=0-2047',
+        },
+        cf: { cacheTtl: 0 },
+      });
+    }
+
+    if (!(res.status >= 200 && res.status < 400)) return false;
+
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if (
+      ct.includes('mpegurl') ||
+      ct.includes('m3u') ||
+      ct.includes('application/vnd.apple.mpegurl') ||
+      ct.includes('video/') ||
+      ct.includes('application/octet-stream')
+    ) {
+      return true;
+    }
+
+    if (res.body) {
+      const text = await res.text();
+      const head = (text || '').slice(0, 200).trim();
+      if (
+        head.startsWith('#EXTM3U') ||
+        head.includes('#EXTINF') ||
+        head.includes('#EXT-X-')
+      ) {
+        return true;
+      }
+      if (
+        head.startsWith('{') ||
+        head.startsWith('<!DOCTYPE') ||
+        head.startsWith('<html')
+      ) {
+        return false;
+      }
+      return res.status >= 200 && res.status < 300;
+    }
+
+    return true;
+  } catch (e) {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function filterAliveChannels(canales, { force = false } = {}) {
+  if (!canales || !canales.length) return [];
+
+  const results = [];
+  let i = 0;
+
+  async function worker() {
+    while (i < canales.length) {
+      const idx = i++;
+      const ch = canales[idx];
+      if (!ch || !ch.url) continue;
+
+      const healthKey = 'health:' + ch.url;
+      let alive = null;
+
+      if (!force) {
+        const cached = getCache(healthKey);
+        if (cached != null) alive = cached;
+      }
+
+      if (alive == null) {
+        alive = await isStreamAlive(ch.url);
+        setCache(healthKey, alive, HEALTH_TTL_MS);
+      }
+
+      if (alive) {
+        results.push({ ...ch, alive: true });
+      }
+    }
+  }
+
+  const n = Math.min(CHECK_CONCURRENCY, canales.length);
+  const workers = [];
+  for (let w = 0; w < n; w++) workers.push(worker());
+  await Promise.all(workers);
+
+  return results;
 }
 
 // ============================================================
@@ -319,15 +519,12 @@ function parseM3U(text, fuente, country = null) {
         country: country || null,
       };
 
-      // tvg-logo="..."
       const logoM = line.match(/tvg-logo="([^"]*)"/i);
       if (logoM) current.logo = logoM[1] || null;
 
-      // group-title="..."
       const groupM = line.match(/group-title="([^"]*)"/i);
       if (groupM) current.grupo = groupM[1] || null;
 
-      // Nombre: después de la última coma
       const comma = line.lastIndexOf(',');
       if (comma !== -1) {
         current.nombre = line.slice(comma + 1).trim();
@@ -349,10 +546,7 @@ function parseM3U(text, fuente, country = null) {
 // ============================================================
 async function fetchText(url) {
   const res = await fetch(url, {
-    headers: {
-      'User-Agent': UA,
-      Accept: '*/*',
-    },
+    headers: { 'User-Agent': UA, Accept: '*/*' },
     cf: { cacheTtl: 1800, cacheEverything: true },
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} al bajar ${url}`);
@@ -369,25 +563,19 @@ function getCache(key) {
   return entry.data;
 }
 
-function setCache(key, data) {
-  cache.set(key, { data, expires: Date.now() + CACHE_TTL_MS });
+function setCache(key, data, ttl = CACHE_TTL_MS) {
+  cache.set(key, { data, expires: Date.now() + ttl });
 }
 
 // ============================================================
-// PROXY HLS (simple)
+// PROXY HLS
 // ============================================================
 async function proxyStream(request, target) {
-  const headers = {
-    'User-Agent': UA,
-    Accept: '*/*',
-  };
-
-  // Reenviar Range si existe (útil para segmentos)
+  const headers = { 'User-Agent': UA, Accept: '*/*' };
   const range = request.headers.get('Range');
   if (range) headers['Range'] = range;
 
   const res = await fetch(target, { headers });
-
   const outHeaders = new Headers(corsHeaders());
   const ct = res.headers.get('Content-Type') || 'application/octet-stream';
   outHeaders.set('Content-Type', ct);
@@ -403,11 +591,12 @@ async function proxyStream(request, target) {
     outHeaders.set('Accept-Ranges', res.headers.get('Accept-Ranges'));
   }
 
-  // Si es playlist, reescribimos URLs relativas a absolutas vía proxy (opcional simple)
-  if (ct.includes('mpegurl') || ct.includes('m3u') || target.includes('.m3u8')) {
-    let body = await res.text();
-    // Dejamos las URLs como están; el player suele resolverlas.
-    // Si necesitas proxy total de segmentos, se puede reescribir aquí.
+  if (
+    ct.includes('mpegurl') ||
+    ct.includes('m3u') ||
+    target.includes('.m3u8')
+  ) {
+    const body = await res.text();
     return new Response(body, { status: res.status, headers: outHeaders });
   }
 
@@ -422,7 +611,8 @@ function corsHeaders() {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Range',
-    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
+    'Access-Control-Expose-Headers':
+      'Content-Length, Content-Range, Accept-Ranges',
   };
 }
 
