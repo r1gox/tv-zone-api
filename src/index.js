@@ -1,13 +1,12 @@
 /**
- * TV Zone API — Cloudflare Worker
+ * TV Zone API — Cloudflare Worker (sin proxy)
  *
  * Fuentes:
  *  - Cable:  https://raw.githubusercontent.com/r1gox/ChannelsTV/refs/heads/main/tv.m3u
  *  - Países: iptv-org
  *
- * Por defecto: TODOS los canales + proxy_url
- * Filtro opcional: ?alive=1  (check permisivo)
- * Re-check:       ?force=1
+ * Por defecto: TODOS los canales
+ * Filtro opcional: ?alive=1
  *
  * Endpoints:
  *  GET /
@@ -17,7 +16,6 @@
  *  GET /tv/countries/:code
  *  GET /tv/search?q=
  *  GET /tv/health?url=
- *  GET /proxy?url=
  */
 
 const CABLE_M3U =
@@ -55,25 +53,13 @@ async function handle(request) {
     return new Response(null, { status: 204, headers: corsHeaders() });
   }
 
-  // ---------- PROXY ----------
-  if (parts[0] === 'proxy') {
-    const target = url.searchParams.get('url') || '';
-    if (!target || !/^https?:\/\//i.test(decodeSafe(target))) {
-      return json(
-        { success: false, error: 'Falta url válida. Uso: /proxy?url={m3u8}' },
-        400
-      );
-    }
-    return proxyStream(request, target);
-  }
-
   // ---------- HOME ----------
   if (path === '/') {
     return json({
       success: true,
       service: 'TV Zone API',
-      version: '1.3.0',
-      nota: 'Por defecto se listan TODOS los canales. Usa proxy_url en el player. ?alive=1 filtra (permisivo).',
+      version: '1.4.0',
+      nota: 'Sin proxy. Usa la url directa del canal en el player. ?alive=1 filtra (permisivo).',
       endpoints: {
         tv: origin + '/tv',
         cable: origin + '/tv/cable',
@@ -81,12 +67,10 @@ async function handle(request) {
         country: origin + '/tv/countries/{code}',
         search: origin + '/tv/search?q={texto}',
         health: origin + '/tv/health?url={m3u8}',
-        proxy: origin + '/proxy?url={m3u8}',
       },
       ejemplos: {
         cable: origin + '/tv/cable',
         mexico: origin + '/tv/countries/mx',
-        cable_vivos: origin + '/tv/cable?alive=1',
         search: origin + '/tv/search?q=espn',
       },
     });
@@ -132,8 +116,6 @@ async function handle(request) {
       canales = await filterAliveChannels(canales, { force });
     }
 
-    canales = attachProxy(canales, origin);
-
     return json({
       success: true,
       fuente: 'cable',
@@ -174,8 +156,6 @@ async function handle(request) {
       canales = await filterAliveChannels(canales, { force });
     }
 
-    canales = attachProxy(canales, origin);
-
     return json({
       success: true,
       fuente: 'iptv-org',
@@ -206,7 +186,6 @@ async function handle(request) {
     if (wantAlive) {
       results = await filterAliveChannels(results, { force });
     }
-    results = attachProxy(results, origin);
 
     return json({
       success: true,
@@ -222,7 +201,7 @@ async function handle(request) {
 }
 
 // ============================================================
-// CABLE (GitHub)
+// CABLE
 // ============================================================
 async function getCableChannels() {
   const key = 'cable';
@@ -342,7 +321,7 @@ async function searchChannels(q, countryCode) {
 }
 
 // ============================================================
-// HEALTH CHECK (permisivo)
+// HEALTH CHECK (permisivo, solo si ?alive=1)
 // ============================================================
 async function isStreamAlive(streamUrl) {
   if (!streamUrl || !/^https?:\/\//i.test(streamUrl)) return false;
@@ -356,30 +335,25 @@ async function isStreamAlive(streamUrl) {
       redirect: 'follow',
       signal: controller.signal,
       headers: {
-        ...buildUpstreamHeaders(streamUrl),
+        'User-Agent': UA,
+        Accept: '*/*',
         Range: 'bytes=0-4095',
       },
       cf: { cacheTtl: 0 },
     });
 
-    // Muertos claros
     if (res.status === 404 || res.status === 410 || res.status === 451) return false;
     if (res.status >= 500) return false;
-
-    // 401/403: a menudo geo-block desde CF, pero puede funcionar en el player
     if (res.status === 401 || res.status === 403) return true;
 
     if (res.status >= 200 && res.status < 400) {
       const ct = (res.headers.get('content-type') || '').toLowerCase();
-
       if (
         ct.includes('mpegurl') ||
         ct.includes('m3u') ||
-        ct.includes('apple.mpegurl') ||
         ct.includes('video/') ||
         ct.includes('audio/') ||
-        ct.includes('application/octet-stream') ||
-        ct.includes('binary')
+        ct.includes('octet-stream')
       ) {
         return true;
       }
@@ -392,25 +366,16 @@ async function isStreamAlive(streamUrl) {
       }
 
       if (!head) return true;
-
-      if (
-        head.startsWith('#EXTM3U') ||
-        head.includes('#EXTINF') ||
-        head.includes('#EXT-X-')
-      ) {
-        return true;
-      }
+      if (head.startsWith('#EXTM3U') || head.includes('#EXT-X-')) return true;
 
       const low = head.toLowerCase();
       if (
         low.startsWith('<!doctype') ||
         low.startsWith('<html') ||
-        low.startsWith('<head') ||
-        (low.startsWith('{') && (low.includes('"error"') || low.includes('"message"')))
+        (low.startsWith('{') && low.includes('error'))
       ) {
         return false;
       }
-
       return true;
     }
 
@@ -457,211 +422,6 @@ async function filterAliveChannels(canales, { force = false } = {}) {
 }
 
 // ============================================================
-// PROXY HLS (playlist + segmentos)
-// ============================================================
-// ============================================================
-// PROXY HLS (robusto)
-// ============================================================
-async function proxyStream(request, target) {
-  // 1) Decodificar bien (evita doble encode)
-  let decoded = target;
-  try {
-    // Si viene muy encoded, decodificar hasta 3 veces
-    for (let i = 0; i < 3; i++) {
-      const next = decodeURIComponent(decoded);
-      if (next === decoded) break;
-      decoded = next;
-    }
-  } catch (e) {}
-
-  // Si alguien pasó una URL que ya es de este proxy, sacar la url real
-  try {
-    const maybe = new URL(decoded);
-    if (maybe.pathname === '/proxy' && maybe.searchParams.get('url')) {
-      decoded = maybe.searchParams.get('url');
-      try {
-        decoded = decodeURIComponent(decoded);
-      } catch (e2) {}
-    }
-  } catch (e) {}
-
-  if (!/^https?:\/\//i.test(decoded)) {
-    return json({ success: false, error: 'url inválida', got: decoded }, 400);
-  }
-
-  // Bloquear loops raros
-  if (decoded.includes('/proxy?url=')) {
-    try {
-      const u = new URL(decoded);
-      if (u.searchParams.get('url')) decoded = u.searchParams.get('url');
-    } catch (e) {}
-  }
-
-  const workerOrigin = new URL(request.url).origin;
-  const headers = buildUpstreamHeaders(decoded);
-
-  // Range del cliente (segmentos)
-  const range = request.headers.get('Range');
-  if (range) headers['Range'] = range;
-
-  let res;
-  try {
-    res = await fetch(decoded, {
-      method: 'GET',
-      headers,
-      redirect: 'follow',
-      cf: { cacheTtl: 0, cacheEverything: false },
-    });
-  } catch (e) {
-    return json(
-      {
-        success: false,
-        error: 'No se pudo conectar al origen',
-        detail: String(e && e.message ? e.message : e),
-        target: decoded,
-      },
-      502
-    );
-  }
-
-  // Leer un peek del body para detectar playlist aunque content-type mienta
-  const ct = (res.headers.get('Content-Type') || '').toLowerCase();
-  const urlLooksPlaylist = /\.m3u8?(?:\?|$)/i.test(decoded);
-
-  // Clonar para poder inspeccionar texto si hace falta
-  const contentLength = res.headers.get('Content-Length');
-  const smallEnough =
-    !contentLength || Number(contentLength) < 2_000_000; // 2MB
-
-  let isPlaylist = false;
-  let playlistText = null;
-
-  if (res.ok && (urlLooksPlaylist || ct.includes('mpegurl') || ct.includes('m3u') || ct.includes('text/plain') || ct.includes('application/octet-stream') || !ct)) {
-    if (smallEnough) {
-      try {
-        const text = await res.text();
-        const head = (text || '').trim().slice(0, 20);
-        if (head.startsWith('#EXTM3U') || text.includes('#EXTINF') || text.includes('#EXT-X-')) {
-          isPlaylist = true;
-          playlistText = text;
-        } else {
-          // No era playlist: devolver como binario/texto tal cual
-          const outHeaders = baseOutHeaders(res);
-          outHeaders.set('Content-Type', ct || 'application/octet-stream');
-          return new Response(text, { status: res.status, headers: outHeaders });
-        }
-      } catch (e) {
-        // si falla el text(), seguimos como stream binario abajo
-      }
-    }
-  }
-
-  // PLAYLIST → reescribir
-  if (isPlaylist && playlistText != null) {
-    const rewritten = rewritePlaylist(playlistText, decoded, workerOrigin);
-    const outHeaders = baseOutHeaders(res);
-    outHeaders.set('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
-    outHeaders.delete('Content-Length'); // cambió el tamaño
-    return new Response(rewritten, { status: 200, headers: outHeaders });
-  }
-
-  // SEGMENTO / OTRO → pasar body tal cual
-  const outHeaders = baseOutHeaders(res);
-  outHeaders.set(
-    'Content-Type',
-    res.headers.get('Content-Type') || 'application/octet-stream'
-  );
-  return new Response(res.body, { status: res.status, headers: outHeaders });
-}
-
-function baseOutHeaders(res) {
-  const outHeaders = new Headers(corsHeaders());
-  outHeaders.set('Access-Control-Allow-Origin', '*');
-  outHeaders.set('Cache-Control', 'no-store');
-  outHeaders.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
-
-  const pass = ['Content-Length', 'Content-Range', 'Accept-Ranges', 'Content-Type'];
-  for (const h of pass) {
-    const v = res.headers.get(h);
-    if (v) outHeaders.set(h, v);
-  }
-  return outHeaders;
-}
-
-function buildUpstreamHeaders(streamUrl) {
-  let host = '';
-  try {
-    host = new URL(streamUrl).origin;
-  } catch (e) {}
-
-  const headers = {
-    'User-Agent': UA,
-    Accept: '*/*',
-    'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-    'Accept-Encoding': 'identity', // importante: evita gzip raro en ts
-  };
-
-  if (host) {
-    headers['Referer'] = host + '/';
-    headers['Origin'] = host;
-  }
-  return headers;
-}
-
-function rewritePlaylist(body, playlistUrl, workerOrigin) {
-  const base = playlistUrl.replace(/[^\/?#]+(\?.*)?$/, '');
-  let playlistOrigin = '';
-  try {
-    playlistOrigin = new URL(playlistUrl).origin;
-  } catch (e) {}
-
-  const lines = body.split(/\r?\n/);
-  const out = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    let line = lines[i];
-
-    // URI="..." dentro de tags (#EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA, etc.)
-    if (/URI="/i.test(line)) {
-      line = line.replace(/URI="([^"]+)"/gi, (_, uri) => {
-        const abs = toAbsolute(uri.trim(), base, playlistOrigin);
-        const proxied = workerOrigin + '/proxy?url=' + encodeURIComponent(abs);
-        return 'URI="' + proxied + '"';
-      });
-      out.push(line);
-      continue;
-    }
-
-    const trimmed = line.trim();
-
-    // Línea de URL (segmento o sub-playlist)
-    if (trimmed && !trimmed.startsWith('#')) {
-      const abs = toAbsolute(trimmed, base, playlistOrigin);
-      out.push(workerOrigin + '/proxy?url=' + encodeURIComponent(abs));
-      continue;
-    }
-
-    out.push(line);
-  }
-
-  return out.join('\n');
-}
-
-function toAbsolute(uri, base, origin) {
-  if (!uri) return uri;
-  uri = uri.trim();
-  if (/^https?:\/\//i.test(uri)) return uri;
-  if (uri.startsWith('//')) return 'https:' + uri;
-  if (uri.startsWith('/')) return (origin || '') + uri;
-  try {
-    return new URL(uri, base || origin || undefined).href;
-  } catch (e) {
-    return (base || '') + uri;
-  }
-}
-
-
-// ============================================================
 // PARSER M3U
 // ============================================================
 function parseM3U(text, fuente, country = null) {
@@ -704,15 +464,6 @@ function parseM3U(text, fuente, country = null) {
 // ============================================================
 // HELPERS
 // ============================================================
-function attachProxy(canales, origin) {
-  return (canales || []).map((c) => ({
-    ...c,
-    proxy_url: c.url
-      ? origin + '/proxy?url=' + encodeURIComponent(c.url)
-      : null,
-  }));
-}
-
 function uniqueGroups(canales) {
   return [...new Set((canales || []).map((c) => c.grupo).filter(Boolean))].sort();
 }
@@ -740,25 +491,11 @@ function setCache(key, data, ttl = CACHE_TTL_MS) {
   cache.set(key, { data, expires: Date.now() + ttl });
 }
 
-function decodeSafe(s) {
-  try {
-    return decodeURIComponent(s);
-  } catch (e) {
-    return s;
-  }
-}
-
-function copyHeader(from, to, name) {
-  const v = from.headers.get(name);
-  if (v) to.set(name, v);
-}
-
 function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Range',
-    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
+    'Access-Control-Allow-Headers': 'Content-Type',
   };
 }
 
